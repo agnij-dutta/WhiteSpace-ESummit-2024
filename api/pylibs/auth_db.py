@@ -1,78 +1,149 @@
 import sqlite3
-import hashlib
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+import jwt
+from passlib.context import CryptContext
+from datetime import datetime
 import os
+from contextlib import contextmanager
 
-# Database setup
-DB_NAME = 'auth_data.db'
+# Constants
+DATABASE_PATH = "hacktivate.db"
+SECRET_KEY = os.getenv("JWT_SECRET", "your-secret-key")  # Use environment variable in production
+ALGORITHM = "HS256"
 
-def create_table():
-    """Create users table if it doesn't exist."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Security
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-def hash_password(password, salt=None):
-    """
-    Hash a password with an optional salt.
-    If no salt is provided, generate a new one.
-    Returns the salt and hashed password.
-    """
-    if not salt:
-        salt = os.urandom(16).hex()
-    salted_password = f"{password}{salt}"
-    password_hash = hashlib.sha256(salted_password.encode()).hexdigest()
-    return salt, password_hash
-
-def register(username, password):
-    """
-    Register a new user.
-    Stores the username, hashed password, and salt in the database.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
     try:
-        salt, password_hash = hash_password(password)
-        cursor.execute('INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)',
-                       (username, password_hash, salt))
-        conn.commit()
-        print(f"User '{username}' registered successfully.")
-    except sqlite3.IntegrityError:
-        print(f"Error: Username '{username}' already exists.")
+        yield conn
     finally:
         conn.close()
 
-def authenticate(username, password):
-    """
-    Authenticate a user.
-    Verifies the username and password against stored credentials.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT password_hash, salt FROM users WHERE username = ?', (username,))
-    result = cursor.fetchone()
-    conn.close()
+def init_db():
+    """Initialize the database with required tables"""
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                account_type TEXT NOT NULL,
+                company_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-    if not result:
-        print("Authentication failed: Username not found.")
+            CREATE TABLE IF NOT EXISTS profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                name TEXT,
+                github_username TEXT,
+                linkedin_url TEXT,
+                resume_path TEXT,
+                linkedin_path TEXT,
+                analysis_results TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS hackathons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organizer_id INTEGER,
+                name TEXT NOT NULL,
+                description TEXT,
+                start_date TIMESTAMP,
+                end_date TIMESTAMP,
+                application_deadline TIMESTAMP,
+                primary_track TEXT,
+                difficulty TEXT,
+                prize_pool REAL,
+                external_url TEXT,
+                quick_apply_enabled BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (organizer_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER,
+                hackathon_id INTEGER,
+                apply_type TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                FOREIGN KEY (profile_id) REFERENCES profiles(id),
+                FOREIGN KEY (hackathon_id) REFERENCES hackathons(id)
+            );
+        """)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def get_user(email: str):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+        user = cursor.fetchone()
+        if user:
+            return dict(user)
+    return None
+
+def get_user_by_id(user_id: int):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        if user:
+            return dict(user)
+    return None
+
+def register_user(email: str, password: str, account_type: str, company_name: str = None) -> bool:
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            hashed_password = get_password_hash(password)
+            cursor.execute(
+                """
+                INSERT INTO users (email, password_hash, account_type, company_name)
+                VALUES (?, ?, ?, ?)
+                """,
+                (email, hashed_password, account_type, company_name)
+            )
+            conn.commit()
+            return True
+    except sqlite3.IntegrityError:
         return False
 
-    stored_hash, salt = result
-    _, input_hash = hash_password(password, salt)
+def verify_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.JWTError:
+        raise HTTPException(status_code=401, detail="Could not validate token")
 
-    if input_hash == stored_hash:
-        print("Authentication successful!")
-        return True
-    else:
-        print("Authentication failed: Incorrect password.")
-        return False
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = verify_token(token)
+    user = get_user_by_id(payload["sub"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+async def verify_organizer(current_user = Depends(get_current_user)):
+    if current_user["account_type"] != "company":
+        raise HTTPException(status_code=403, detail="Not authorized as organizer")
+    return current_user
 
 #
