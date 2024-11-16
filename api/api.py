@@ -1,94 +1,102 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import httpx
-
-from pylibs.auth import authenticate, register
-
-register("admin", "password")
-authenticate("admin", "password")
-authenticate("admin", "wrong_password")
-register("admin", "password")
+from typing import Optional
+from .pylibs.auth import register_user, verify_password, get_user, init_db
+from .pylibs.jwt_utils import create_jwt_token, verify_jwt_token
+from resume_analysis.models.enhanced_resume_scorer import EnhancedResumeScorer
+from resume_analysis.config import Config
 
 app = FastAPI()
 
-# Replace with your actual backend URL
-AUTH_BACKEND_URL = "http://backend-service-url:8000"
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
-# Request Body Models
-class SignupRequest(BaseModel):
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class UserLogin(BaseModel):
     email: str
     password: str
 
-class LoginRequest(BaseModel):
+class UserRegister(BaseModel):
     email: str
     password: str
+    accountType: str
+    companyName: Optional[str] = None
 
-# Profile Request Body Model
-class ProfileRequest(BaseModel):
-    username: str
-    password: str
-    email: str
-
-
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-# Signup Route
-@app.post("/auth/signup")
-async def signup_user(data: SignupRequest):
+async def get_auth_token(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
     try:
-        async with httpx.AsyncClient() as client:
-            # Forward the signup request to the backend
-            response = await client.post(
-                f"{AUTH_BACKEND_URL}/signup", json=data.dict()
-            )
-            
-            if response.status_code != 201:
-                raise HTTPException(
-                    status_code=response.status_code, detail=response.json().get("detail", "Signup failed")
-                )
-            return {"message": "User signed up successfully"}
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        scheme, token = authorization.split()
+        if scheme.lower() != 'bearer':
+            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+        return token
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
 
-# Login Route
-@app.post("/auth/login")
-async def login_user(data: LoginRequest):
-    try:
-        async with httpx.AsyncClient() as client:
-            # Forward the login request to the backend
-            response = await client.post(
-                f"{AUTH_BACKEND_URL}/login", json=data.dict()
-            )
-            
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code, detail=response.json().get("detail", "Login failed")
-                )
-            
-            # Assuming backend sends back a token and user info
-            return response.json()
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/api/auth/register")
+async def register(user_data: UserRegister):
+    if not register_user(
+        user_data.email,
+        user_data.password,
+        user_data.accountType,
+        user_data.companyName
+    ):
+        raise HTTPException(status_code=400, detail="Email already registered")
     
-# Profile Creation Route
-@app.post("/edit_profile")
-async def create_profile(data: ProfileRequest):
+    token = create_jwt_token(user_data.email)
+    return {"token": token, "email": user_data.email}
+
+@app.post("/api/auth/login")
+async def login(user_data: UserLogin):
+    if not verify_password(user_data.email, user_data.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    user = get_user(user_data.email)
+    token = create_jwt_token(user_data.email)
+    return {"token": token, "user": user}
+
+@app.post("/api/analyze-resume")
+async def analyze_resume(
+    resume_file: UploadFile = File(...),
+    github_username: Optional[str] = None,
+    token: str = Depends(get_auth_token)
+):
     try:
-        async with httpx.AsyncClient() as client:
-            # Forward the profile creation request to the backend
-            response = await client.post(
-                f"{AUTH_BACKEND_URL}/profile", json=data.dict()
-            )
-            
-            if response.status_code != 201:
-                raise HTTPException(
-                    status_code=response.status_code, detail=response.json().get("detail", "Profile creation failed")
-                )
-            return {"message": "Profile created successfully"}
-    except httpx.HTTPError as e:
+        resume_bytes = await resume_file.read()
+        config = Config()
+        scorer = EnhancedResumeScorer(config)
+        
+        analysis = await scorer.analyze_profile(
+            resume_pdf=resume_bytes,
+            github_username=github_username
+        )
+        
+        return analysis
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# quick apply and apply for the hackathons 
+@app.get("/api/auth/verify")
+async def verify_auth(token: str = Depends(get_auth_token)):
+    try:
+        email = verify_jwt_token(token)
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        user = get_user(email)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+            
+        return {"verified": True, "user": user}
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Authentication failed")
